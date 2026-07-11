@@ -56,18 +56,31 @@ async function login() {
     headers: headers(),
     body: JSON.stringify({ clientcode: CLIENT_CODE, password: PIN, totp })
   });
-  const d = await r.json();
+  let d;
+  try { d = await r.json(); }
+  catch (e) {
+    const text = await r.text().catch(() => '');
+    throw new Error('Login endpoint returned non-JSON (likely rate-limited/blocked): ' + text.slice(0, 120));
+  }
   if (!d.status || !d.data) throw new Error('Login failed: ' + (d.message || 'unknown'));
   session = { jwt: d.data.jwtToken, feed: d.data.feedToken, at: Date.now() };
   console.log('✅ Angel One login OK');
   return session;
 }
 
+// Multiple parallel requests (analyze() fires several apiPost calls at once,
+// PLUS the background alert scheduler runs independently) could all notice an
+// expired session simultaneously and each try to log in — Angel's login
+// endpoint is rate-limited and starts returning "Access Denied" HTML instead
+// of JSON if hit too many times in a row. This mutex makes concurrent callers
+// share ONE in-flight login instead of firing several at once.
+let loginInFlight = null;
 async function ensureSession() {
-  // Re-login every 6 hours or if never logged in
-  if (!session.jwt || Date.now() - session.at > 6 * 3600 * 1000) {
-    await login();
+  if (session.jwt && Date.now() - session.at <= 6 * 3600 * 1000) return session;
+  if (!loginInFlight) {
+    loginInFlight = login().finally(() => { loginInFlight = null; });
   }
+  await loginInFlight;
   return session;
 }
 
@@ -538,7 +551,9 @@ async function ensureScripMaster() {
   if (scripMaster.map.size && Date.now() - scripMaster.at < REFRESH_MS) return scripMaster.map;
   console.log('📥 Downloading Angel One scrip master (daily refresh)...');
   const r = await fetch(SCRIP_MASTER_URL);
-  const arr = await r.json();
+  let arr;
+  try { arr = await r.json(); }
+  catch (e) { throw new Error('Scrip master returned non-JSON (server may be temporarily down)'); }
   const map = new Map();
   for (const row of arr) {
     if (row.instrumenttype !== 'OPTIDX') continue;
@@ -1444,17 +1459,35 @@ async function analyze(idx, expiryParam, opts = {}) {
 
 // ---------------- Routes ----------------
 app.get('/', (req, res) => res.json({
-  app: 'Gamma X Backend v2', ok: true,
-  whatsNew: [
-    'targetPrice per strike = momentum-projected Black-Scholes reprice (5min lookback / 15min horizon by default, configurable via ?lookbackMinutes & ?projectMinutes)',
-    'Auto win-rate logging to Google Sheet: set SHEET_WEBHOOK_URL env var to an Apps Script Web App URL — predictions + resolved outcomes get logged automatically, no manual work',
-    'fairValue now uses model IV (smoothed broker IV + realized vol blend) — no longer circular with LTP',
-    'chain[].ltp is the REAL traded market price (Angel scrip master + bulk quote), independent of fairValue',
-    'chain[].edge / edgePct = fairValue - ltp, a genuine mispricing signal',
-    'marketBias: composite -100..100 bullish/bearish tilt with suggestedSide (CE/PE) and human-readable notes',
-    'cheapBlastCandidates: top ₹1-₹20 premium OTM strikes ranked for gamma-blast potential, with illustrative target1SigmaMultiple/target2SigmaMultiple'
+  app: 'Gamma X Backend — ULTIMATE (all features in one file)', ok: true,
+  features: [
+    'targetPrice: momentum-projected reprice per strike',
+    'fairValue: model IV (smoothed + realized vol blend), not circular with LTP',
+    'chain[].ltp: REAL traded price per strike, chain[].edge = mispricing',
+    'marketBias: -100..100 bullish/bearish with suggestedSide + reasons',
+    'dealerExposure: Net GEX/DEX/Vanna/Charm, Gamma Flip, Call/Put Wall, Hedge Pressure',
+    'expiryMoveRisk: gamma+OI concentration + live order-book imbalance',
+    'cheapBlastCandidates: ranked ₹1-20 OTM strikes with target multiples',
+    'ivPriceInflection: IV-spike + price-reversal trigger with matching strikes',
+    'ultimateSignal: single unambiguous strike pick when signals agree',
+    'keyLevels/allLevels: 5-factor level confluence (OI/gamma/IV/vol/history)',
+    'Push alerts: background scheduler fires phone notification via /subscribe',
+    'Auto win-rate logging to Google Sheet (SHEET_WEBHOOK_URL)',
+    'Historical swing memory (builds over time in sheet)'
   ],
-  endpoints: ['/health', '/spot', '/analyze?index=NIFTY|SENSEX[&expiry=07JUL2026]', '/nifty-spot (legacy)']
+  endpoints: [
+    'GET /health',
+    'GET /debug',
+    'GET /spot',
+    'GET /analyze?index=NIFTY|SENSEX  ← MAIN: sab kuch ek response me',
+    'GET /ultimate-signal?index=NIFTY|SENSEX',
+    'GET /reversal-levels?index=NIFTY|SENSEX  (0.2711% A/B levels)',
+    'GET /historical-zones?index=NIFTY&days=60  (+ breakout cascade)',
+    'POST /level-score  {"index":"NIFTY","levels":[24440]}',
+    'POST /subscribe  (push notification registration)',
+    'GET /vapid-public-key',
+    'GET /nifty-spot (legacy)'
+  ]
 }));
 
 app.get('/health', async (req, res) => {
@@ -1667,7 +1700,7 @@ async function ultimateAlertTick() {
     } catch (e) { console.log('ultimateAlertTick error for', idx, e.message); }
   }
 }
-setInterval(ultimateAlertTick, 60000);
+setInterval(ultimateAlertTick, 90000); // 90s — was 60s; reduces Angel API load / login-rate-limit risk
 
 app.listen(PORT, () => console.log('🚀 Gamma X backend on :' + PORT));
 
